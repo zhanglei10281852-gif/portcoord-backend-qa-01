@@ -67,9 +67,15 @@ func (s *Service) Reserve(ctx context.Context, req ReserveRequest) (*ReserveResu
 	dateStr := s.clock.Now().Format("2006-01-02")
 	limit := s.limitFor(req.QuotaType)
 
-	reserved, quotaID := s.reserveWithRetry(ctx, req.QuotaType, dateStr, limit, req.Amount, 5)
+	reserved, quotaID, err := s.reserveWithRetry(ctx, req.QuotaType, dateStr, limit, req.Amount, 5)
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeInternal, "reserve quota failed", err)
+	}
 	if !reserved {
-		q, _ := s.quotas.GetOrCreateQuota(ctx, req.QuotaType, dateStr, limit)
+		q, err := s.quotas.GetOrCreateQuota(ctx, req.QuotaType, dateStr, limit)
+		if err != nil {
+			return nil, apperr.Wrap(apperr.CodeInternal, "quota re-read failed", err)
+		}
 		available := 0
 		if q != nil {
 			available = q.Available()
@@ -111,24 +117,24 @@ func (s *Service) Reserve(ctx context.Context, req ReserveRequest) (*ReserveResu
 	}, nil
 }
 
-func (s *Service) reserveWithRetry(ctx context.Context, qt domain.QuotaType, dateStr string, limit, amount, maxRetries int) (bool, string) {
+func (s *Service) reserveWithRetry(ctx context.Context, qt domain.QuotaType, dateStr string, limit, amount, maxRetries int) (bool, string, error) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		q, err := s.quotas.GetOrCreateQuota(ctx, qt, dateStr, limit)
 		if err != nil {
-			return false, ""
+			return false, "", err
 		}
 		if q.Available() < amount {
-			return false, q.ID
+			return false, q.ID, nil
 		}
 		affected, err := s.quotas.ReserveQuota(ctx, q.ID, amount, q.Version)
 		if err != nil {
-			return false, q.ID
+			return false, q.ID, err
 		}
 		if affected > 0 {
-			return true, q.ID
+			return true, q.ID, nil
 		}
 	}
-	return false, ""
+	return false, "", apperr.Conflict("quota", string(qt), 0)
 }
 
 func (s *Service) Commit(ctx context.Context, quotaID string, amount int, version int, actor, requestID string) error {

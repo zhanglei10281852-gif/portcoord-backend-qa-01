@@ -67,7 +67,12 @@ func (s *Service) Reserve(ctx context.Context, req ReserveRequest) (*ReserveResu
 	dateStr := s.clock.Now().Format("2006-01-02")
 	limit := s.limitFor(req.QuotaType)
 
-	reserved, quotaID := s.reserveWithRetry(ctx, req.QuotaType, dateStr, limit, req.Amount, 5)
+	reserved, quotaID, err := s.reserveWithRetry(ctx, req.QuotaType, dateStr, limit, req.Amount, 5)
+	if err != nil {
+		// Storage fault, not quota exhaustion: surface a service error so callers
+		// can distinguish a down store from a genuinely full quota.
+		return nil, err
+	}
 	if !reserved {
 		q, _ := s.quotas.GetOrCreateQuota(ctx, req.QuotaType, dateStr, limit)
 		available := 0
@@ -111,24 +116,31 @@ func (s *Service) Reserve(ctx context.Context, req ReserveRequest) (*ReserveResu
 	}, nil
 }
 
-func (s *Service) reserveWithRetry(ctx context.Context, qt domain.QuotaType, dateStr string, limit, amount, maxRetries int) (bool, string) {
+// reserveWithRetry attempts an optimistic-lock reserve, retrying on version
+// conflicts. It distinguishes three outcomes for the caller:
+//   - reserved=true: the reservation succeeded.
+//   - reserved=false, err=nil: the quota is genuinely exhausted (available <
+//     amount). Callers may report this as a normal business rejection.
+//   - err!=nil: the quota store is unavailable. Callers must surface this as a
+//     service error rather than mistaking it for quota exhaustion.
+func (s *Service) reserveWithRetry(ctx context.Context, qt domain.QuotaType, dateStr string, limit, amount, maxRetries int) (bool, string, error) {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		q, err := s.quotas.GetOrCreateQuota(ctx, qt, dateStr, limit)
 		if err != nil {
-			return false, ""
+			return false, "", apperr.Wrap(apperr.CodeUnavailable, "quota store unavailable", err)
 		}
 		if q.Available() < amount {
-			return false, q.ID
+			return false, q.ID, nil
 		}
 		affected, err := s.quotas.ReserveQuota(ctx, q.ID, amount, q.Version)
 		if err != nil {
-			return false, q.ID
+			return false, q.ID, apperr.Wrap(apperr.CodeUnavailable, "quota store unavailable", err)
 		}
 		if affected > 0 {
-			return true, q.ID
+			return true, q.ID, nil
 		}
 	}
-	return false, ""
+	return false, "", nil
 }
 
 func (s *Service) Commit(ctx context.Context, quotaID string, amount int, version int, actor, requestID string) error {
